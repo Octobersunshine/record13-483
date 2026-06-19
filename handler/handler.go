@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"image-safety-detector/detector"
 )
@@ -15,12 +17,33 @@ type DetectRequest struct {
 }
 
 type APIResponse struct {
-	Success bool                `json:"success"`
+	Success bool                     `json:"success"`
 	Data    *detector.DetectionResult `json:"data,omitempty"`
-	Error   string              `json:"error,omitempty"`
+	Error   string                   `json:"error,omitempty"`
 }
 
-func HandleDetect(w http.ResponseWriter, r *http.Request) {
+type PoolStatsResponse struct {
+	Success      bool   `json:"success"`
+	WorkerCount  int    `json:"worker_count"`
+	QueueSize    int    `json:"queue_size"`
+	PendingTasks int    `json:"pending_tasks"`
+	Processed    uint64 `json:"processed_total"`
+	Error        string `json:"error,omitempty"`
+}
+
+type Handler struct {
+	Pool            *detector.Pool
+	DefaultTimeout  time.Duration
+}
+
+func NewHandler(pool *detector.Pool) *Handler {
+	return &Handler{
+		Pool:           pool,
+		DefaultTimeout: 10 * time.Second,
+	}
+}
+
+func (h *Handler) HandleDetect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	if r.Method != http.MethodPost {
@@ -58,22 +81,10 @@ func HandleDetect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := detector.Detect(absPath)
-
-	statusCode := http.StatusOK
-	if !result.IsSafe && result.Error == "" {
-		statusCode = http.StatusOK
-	} else if result.Error != "" && !result.IsSafe {
-		statusCode = http.StatusOK
-	}
-
-	writeJSON(w, statusCode, APIResponse{
-		Success: result.Error == "",
-		Data:    &result,
-	})
+	h.submitAndRespond(w, r, absPath)
 }
 
-func HandleDetectForm(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleDetectForm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	if r.Method != http.MethodPost {
@@ -102,19 +113,73 @@ func HandleDetectForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := detector.Detect(absPath)
+	h.submitAndRespond(w, r, absPath)
+}
 
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: result.Error == "",
+func (h *Handler) submitAndRespond(w http.ResponseWriter, r *http.Request, absPath string) {
+	ctx := r.Context()
+	timeoutCtx, cancel := contextWithTimeout(ctx, h.DefaultTimeout)
+	defer cancel()
+
+	result, err := h.Pool.Submit(timeoutCtx, absPath)
+	if err != nil {
+		statusCode := http.StatusOK
+		switch {
+		case errors.Is(err, detector.ErrPoolClosed):
+			statusCode = http.StatusServiceUnavailable
+		case errors.Is(err, detector.ErrPoolBusy):
+			statusCode = http.StatusTooManyRequests
+		default:
+			statusCode = http.StatusRequestTimeout
+		}
+		writeJSON(w, statusCode, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("detection submission failed: %v", err),
+		})
+		return
+	}
+
+	statusCode := http.StatusOK
+	success := result.Error == ""
+
+	writeJSON(w, statusCode, APIResponse{
+		Success: success,
 		Data:    &result,
 	})
 }
 
-func HandleHealth(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandlePoolStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "ok",
+	workerCount, queueSize, pendingTasks, processed := h.Pool.Stats()
+	writeJSON(w, http.StatusOK, PoolStatsResponse{
+		Success:      true,
+		WorkerCount:  workerCount,
+		QueueSize:    queueSize,
+		PendingTasks: pendingTasks,
+		Processed:    processed,
 	})
+}
+
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	workerCount, _, pendingTasks, processed := h.Pool.Stats()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":         "ok",
+		"pool_workers":   workerCount,
+		"pending_tasks":  pendingTasks,
+		"processed":      processed,
+	})
+}
+
+func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	deadline, ok := parent.Deadline()
+	if ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 && remaining < timeout {
+			return context.WithTimeout(parent, remaining)
+		}
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data interface{}) {

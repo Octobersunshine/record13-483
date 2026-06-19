@@ -1,13 +1,19 @@
 package detector
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 	"strings"
 )
 
@@ -37,6 +43,7 @@ type DetectionResult struct {
 	FileName     string            `json:"file_name"`
 	ImageSize    string            `json:"image_size,omitempty"`
 	Error        string            `json:"error,omitempty"`
+	ProcessedBy  int               `json:"-"`
 }
 
 type DetectionDetail struct {
@@ -45,16 +52,212 @@ type DetectionDetail struct {
 	Description string            `json:"description"`
 }
 
-var allowedExtensions = map[string]bool{
-	".jpg":  true,
-	".jpeg": true,
-	".png":  true,
-	".bmp":  true,
-	".gif":  true,
-	".webp": true,
+type Task struct {
+	ImagePath string
+	ResultCh  chan DetectionResult
+	Ctx       context.Context
+}
+
+type Pool struct {
+	workerCount int
+	queueSize   int
+	taskCh      chan Task
+	wg          sync.WaitGroup
+	shutdownCh  chan struct{}
+	once        sync.Once
+	closed      atomic.Bool
+	processed   atomic.Uint64
+}
+
+type PoolOption func(*Pool)
+
+var (
+	ErrPoolClosed   = errors.New("detector pool is closed")
+	ErrPoolBusy     = errors.New("detector pool is busy, please retry later")
+	ErrTaskCanceled = errors.New("task canceled before processing")
+
+	allowedExtensions = map[string]bool{
+		".jpg":  true,
+		".jpeg": true,
+		".png":  true,
+		".bmp":  true,
+		".gif":  true,
+		".webp": true,
+	}
+)
+
+func WithWorkerCount(n int) PoolOption {
+	return func(p *Pool) {
+		if n > 0 {
+			p.workerCount = n
+		}
+	}
+}
+
+func WithQueueSize(n int) PoolOption {
+	return func(p *Pool) {
+		if n > 0 {
+			p.queueSize = n
+		}
+	}
+}
+
+func NewPool(opts ...PoolOption) *Pool {
+	p := &Pool{
+		workerCount: runtime.NumCPU(),
+		queueSize:   128,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	if p.workerCount < 1 {
+		p.workerCount = 1
+	}
+	if p.queueSize < 1 {
+		p.queueSize = 1
+	}
+
+	p.taskCh = make(chan Task, p.queueSize)
+	p.shutdownCh = make(chan struct{})
+
+	p.wg.Add(p.workerCount)
+	for i := 0; i < p.workerCount; i++ {
+		go p.worker(i)
+	}
+	return p
+}
+
+func (p *Pool) worker(id int) {
+	defer p.wg.Done()
+
+	localBuf := make([]DetectionDetail, 0, 4)
+
+	for {
+		select {
+		case task, ok := <-p.taskCh:
+			if !ok {
+				return
+			}
+			result := p.processTask(task, id, &localBuf)
+			select {
+			case task.ResultCh <- result:
+			case <-task.Ctx.Done():
+			case <-p.shutdownCh:
+				select {
+				case task.ResultCh <- result:
+				default:
+				}
+			}
+		case <-p.shutdownCh:
+			return
+		}
+	}
+}
+
+func (p *Pool) processTask(task Task, workerID int, localBuf *[]DetectionDetail) DetectionResult {
+	p.processed.Add(1)
+
+	select {
+	case <-task.Ctx.Done():
+		return DetectionResult{
+			FilePath:    task.ImagePath,
+			FileName:    filepath.Base(task.ImagePath),
+			Error:       ErrTaskCanceled.Error(),
+			ProcessedBy: workerID,
+		}
+	default:
+	}
+
+	result := doDetect(task.ImagePath, localBuf)
+	result.ProcessedBy = workerID
+	return result
+}
+
+func (p *Pool) Submit(ctx context.Context, imagePath string) (DetectionResult, error) {
+	if p.closed.Load() {
+		return DetectionResult{}, ErrPoolClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	resultCh := make(chan DetectionResult, 1)
+	task := Task{
+		ImagePath: imagePath,
+		ResultCh:  resultCh,
+		Ctx:       ctx,
+	}
+
+	select {
+	case p.taskCh <- task:
+	case <-ctx.Done():
+		return DetectionResult{}, ctx.Err()
+	case <-p.shutdownCh:
+		return DetectionResult{}, ErrPoolClosed
+	default:
+		return DetectionResult{}, ErrPoolBusy
+	}
+
+	select {
+	case result := <-resultCh:
+		return result, nil
+	case <-ctx.Done():
+		return DetectionResult{}, ctx.Err()
+	case <-p.shutdownCh:
+		select {
+		case result := <-resultCh:
+			return result, nil
+		default:
+			return DetectionResult{}, ErrPoolClosed
+		}
+	}
+}
+
+func (p *Pool) SubmitWithTimeout(imagePath string, timeout time.Duration) (DetectionResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return p.Submit(ctx, imagePath)
+}
+
+func (p *Pool) Shutdown(timeout ...time.Duration) error {
+	var err error
+	p.once.Do(func() {
+		p.closed.Store(true)
+		close(p.shutdownCh)
+		close(p.taskCh)
+
+		if len(timeout) > 0 && timeout[0] > 0 {
+			done := make(chan struct{})
+			go func() {
+				p.wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(timeout[0]):
+				err = errors.New("pool shutdown timed out, some workers may not have finished")
+			}
+		} else {
+			p.wg.Wait()
+		}
+	})
+	return err
+}
+
+func (p *Pool) Stats() (workerCount, queueSize, pendingTasks int, processed uint64) {
+	workerCount = p.workerCount
+	queueSize = p.queueSize
+	pendingTasks = len(p.taskCh)
+	processed = p.processed.Load()
+	return
 }
 
 func Detect(imagePath string) DetectionResult {
+	localBuf := make([]DetectionDetail, 0, 4)
+	return doDetect(imagePath, &localBuf)
+}
+
+func doDetect(imagePath string, detailBuf *[]DetectionDetail) DetectionResult {
 	result := DetectionResult{
 		FilePath: imagePath,
 		FileName: filepath.Base(imagePath),
@@ -66,11 +269,13 @@ func Detect(imagePath string) DetectionResult {
 		result.SafetyLevel = Unsafe
 		result.Score = 0
 		result.Error = fmt.Sprintf("unsupported image format: %s", ext)
-		result.Categories = []DetectionDetail{{
+		*detailBuf = (*detailBuf)[:0]
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategoryInvalidFormat,
 			Confidence:  1.0,
 			Description: fmt.Sprintf("file extension '%s' is not a supported image format", ext),
-		}}
+		})
+		result.Categories = append([]DetectionDetail(nil), *detailBuf...)
 		return result
 	}
 
@@ -92,11 +297,13 @@ func Detect(imagePath string) DetectionResult {
 		result.SafetyLevel = Unsafe
 		result.Score = 0
 		result.Error = "file is empty"
-		result.Categories = []DetectionDetail{{
+		*detailBuf = (*detailBuf)[:0]
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategoryCorrupted,
 			Confidence:  1.0,
 			Description: "image file is empty (0 bytes)",
-		}}
+		})
+		result.Categories = append([]DetectionDetail(nil), *detailBuf...)
 		return result
 	}
 
@@ -116,11 +323,13 @@ func Detect(imagePath string) DetectionResult {
 		result.SafetyLevel = Unsafe
 		result.Score = 0
 		result.Error = fmt.Sprintf("cannot decode image: %v", err)
-		result.Categories = []DetectionDetail{{
+		*detailBuf = (*detailBuf)[:0]
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategoryCorrupted,
 			Confidence:  0.9,
 			Description: "file cannot be decoded as a valid image",
-		}}
+		})
+		result.Categories = append([]DetectionDetail(nil), *detailBuf...)
 		return result
 	}
 
@@ -133,11 +342,13 @@ func Detect(imagePath string) DetectionResult {
 		result.IsSafe = false
 		result.SafetyLevel = Suspicious
 		result.Score = 0.4
-		result.Categories = []DetectionDetail{{
+		*detailBuf = (*detailBuf)[:0]
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategoryCorrupted,
 			Confidence:  0.7,
 			Description: fmt.Sprintf("image dimensions too small (%dx%d), possibly corrupted or placeholder", width, height),
-		}}
+		})
+		result.Categories = append([]DetectionDetail(nil), *detailBuf...)
 		return result
 	}
 
@@ -145,19 +356,19 @@ func Detect(imagePath string) DetectionResult {
 
 	skinRatio := analyzeSkinPixels(img)
 
-	var details []DetectionDetail
+	*detailBuf = (*detailBuf)[:0]
 	var score float64
 
 	if skinRatio > 0.65 {
 		score = 0.2
-		details = append(details, DetectionDetail{
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategorySkinExposure,
 			Confidence:  skinRatio,
 			Description: fmt.Sprintf("high skin-tone pixel ratio detected (%.1f%%), content may be inappropriate", skinRatio*100),
 		})
 	} else if skinRatio > 0.45 {
 		score = 0.5
-		details = append(details, DetectionDetail{
+		*detailBuf = append(*detailBuf, DetectionDetail{
 			Category:    CategorySkinExposure,
 			Confidence:  skinRatio,
 			Description: fmt.Sprintf("moderate skin-tone pixel ratio detected (%.1f%%), content requires review", skinRatio*100),
@@ -166,7 +377,9 @@ func Detect(imagePath string) DetectionResult {
 		score = 0.95
 	}
 
-	result.Categories = details
+	if len(*detailBuf) > 0 {
+		result.Categories = append([]DetectionDetail(nil), *detailBuf...)
+	}
 	result.Score = score
 
 	if score >= 0.8 {
