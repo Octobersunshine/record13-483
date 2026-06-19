@@ -71,10 +71,16 @@ type Pool struct {
 
 type PoolOption func(*Pool)
 
+const (
+	MaxBatchSize = 50
+)
+
 var (
 	ErrPoolClosed   = errors.New("detector pool is closed")
 	ErrPoolBusy     = errors.New("detector pool is busy, please retry later")
 	ErrTaskCanceled = errors.New("task canceled before processing")
+	ErrBatchEmpty   = errors.New("batch request contains no valid image paths")
+	ErrBatchTooLarge = errors.New(fmt.Sprintf("batch size exceeds maximum limit of %d", MaxBatchSize))
 
 	allowedExtensions = map[string]bool{
 		".jpg":  true,
@@ -250,6 +256,128 @@ func (p *Pool) Stats() (workerCount, queueSize, pendingTasks int, processed uint
 	pendingTasks = len(p.taskCh)
 	processed = p.processed.Load()
 	return
+}
+
+type BatchResult struct {
+	Total      int               `json:"total"`
+	SafeCount  int               `json:"safe_count"`
+	Suspicious int               `json:"suspicious_count"`
+	UnsafeCount int              `json:"unsafe_count"`
+	Results    []DetectionResult `json:"results"`
+}
+
+func (p *Pool) SubmitBatch(ctx context.Context, imagePaths []string) (BatchResult, error) {
+	if p.closed.Load() {
+		return BatchResult{}, ErrPoolClosed
+	}
+	if len(imagePaths) == 0 {
+		return BatchResult{}, ErrBatchEmpty
+	}
+	if len(imagePaths) > MaxBatchSize {
+		return BatchResult{}, ErrBatchTooLarge
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	type indexedResult struct {
+		index  int
+		result DetectionResult
+		err    error
+	}
+
+	resultCh := make(chan indexedResult, len(imagePaths))
+	pending := 0
+
+	for i, path := range imagePaths {
+		path := path
+		idx := i
+
+		taskResultCh := make(chan DetectionResult, 1)
+		task := Task{
+			ImagePath: path,
+			ResultCh:  taskResultCh,
+			Ctx:       ctx,
+		}
+
+		submitted := false
+		select {
+		case p.taskCh <- task:
+			submitted = true
+			pending++
+		case <-ctx.Done():
+			resultCh <- indexedResult{index: idx, err: ctx.Err()}
+		case <-p.shutdownCh:
+			resultCh <- indexedResult{index: idx, err: ErrPoolClosed}
+		default:
+			resultCh <- indexedResult{index: idx, err: ErrPoolBusy}
+		}
+
+		if submitted {
+			go func() {
+				select {
+				case result := <-taskResultCh:
+					resultCh <- indexedResult{index: idx, result: result}
+				case <-ctx.Done():
+					resultCh <- indexedResult{index: idx, err: ctx.Err()}
+				case <-p.shutdownCh:
+					select {
+					case result := <-taskResultCh:
+						resultCh <- indexedResult{index: idx, result: result}
+					default:
+						resultCh <- indexedResult{index: idx, err: ErrPoolClosed}
+					}
+				}
+			}()
+		}
+	}
+
+	batch := BatchResult{
+		Total:   len(imagePaths),
+		Results: make([]DetectionResult, len(imagePaths)),
+	}
+
+	for i := 0; i < len(imagePaths); i++ {
+		select {
+		case ir := <-resultCh:
+			if ir.err != nil {
+				batch.Results[ir.index] = DetectionResult{
+					FilePath: imagePaths[ir.index],
+					FileName: filepath.Base(imagePaths[ir.index]),
+					IsSafe:   false,
+					SafetyLevel: Unsafe,
+					Error:    ir.err.Error(),
+				}
+				batch.UnsafeCount++
+			} else {
+				batch.Results[ir.index] = ir.result
+				switch ir.result.SafetyLevel {
+				case Safe:
+					batch.SafeCount++
+				case Suspicious:
+					batch.Suspicious++
+				case Unsafe:
+					batch.UnsafeCount++
+				}
+			}
+		case <-ctx.Done():
+			for j := i; j < len(imagePaths); j++ {
+				if batch.Results[j].FilePath == "" {
+					batch.Results[j] = DetectionResult{
+						FilePath: imagePaths[j],
+						FileName: filepath.Base(imagePaths[j]),
+						IsSafe:   false,
+						SafetyLevel: Unsafe,
+						Error:    "batch canceled",
+					}
+					batch.UnsafeCount++
+				}
+			}
+			return batch, ctx.Err()
+		}
+	}
+
+	return batch, nil
 }
 
 func Detect(imagePath string) DetectionResult {

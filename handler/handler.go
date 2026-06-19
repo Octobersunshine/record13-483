@@ -16,10 +16,21 @@ type DetectRequest struct {
 	ImagePath string `json:"image_path"`
 }
 
+type BatchDetectRequest struct {
+	ImagePaths []string `json:"image_paths"`
+}
+
 type APIResponse struct {
 	Success bool                     `json:"success"`
 	Data    *detector.DetectionResult `json:"data,omitempty"`
 	Error   string                   `json:"error,omitempty"`
+}
+
+type BatchAPIResponse struct {
+	Success    bool                  `json:"success"`
+	Data       *detector.BatchResult `json:"data,omitempty"`
+	Error      string                `json:"error,omitempty"`
+	FailedIdx  []int                 `json:"failed_indices,omitempty"`
 }
 
 type PoolStatsResponse struct {
@@ -146,6 +157,115 @@ func (h *Handler) submitAndRespond(w http.ResponseWriter, r *http.Request, absPa
 		Success: success,
 		Data:    &result,
 	})
+}
+
+func (h *Handler) HandleBatchDetect(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{
+			Success: false,
+			Error:   "only POST method is allowed",
+		})
+		return
+	}
+
+	var req BatchDetectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, BatchAPIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("invalid request body: %v", err),
+		})
+		return
+	}
+
+	if len(req.ImagePaths) == 0 {
+		writeJSON(w, http.StatusBadRequest, BatchAPIResponse{
+			Success: false,
+			Error:   "image_paths is required and must not be empty",
+		})
+		return
+	}
+
+	absPaths := make([]string, 0, len(req.ImagePaths))
+	for _, p := range req.ImagePaths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		absPaths = append(absPaths, absPath)
+	}
+
+	if len(absPaths) == 0 {
+		writeJSON(w, http.StatusBadRequest, BatchAPIResponse{
+			Success: false,
+			Error:   "no valid image paths provided after normalization",
+		})
+		return
+	}
+
+	ctx := r.Context()
+	timeoutCtx, cancel := contextWithTimeout(ctx, h.DefaultTimeout*time.Duration(max(len(absPaths), 1)))
+	defer cancel()
+
+	batchResult, err := h.Pool.SubmitBatch(timeoutCtx, absPaths)
+
+	if err != nil {
+		statusCode := http.StatusOK
+		switch {
+		case errors.Is(err, detector.ErrPoolClosed):
+			statusCode = http.StatusServiceUnavailable
+		case errors.Is(err, detector.ErrBatchTooLarge):
+			statusCode = http.StatusBadRequest
+		case errors.Is(err, detector.ErrBatchEmpty):
+			statusCode = http.StatusBadRequest
+		default:
+			statusCode = http.StatusRequestTimeout
+		}
+
+		var failedIdx []int
+		if batchResult.Results != nil {
+			for i, r := range batchResult.Results {
+				if r.Error != "" && r.SafetyLevel == detector.Unsafe {
+					failedIdx = append(failedIdx, i)
+				}
+			}
+		}
+
+		resp := BatchAPIResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("batch detection partially failed: %v", err),
+			FailedIdx: failedIdx,
+		}
+		if batchResult.Results != nil {
+			resp.Data = &batchResult
+		}
+		writeJSON(w, statusCode, resp)
+		return
+	}
+
+	var failedIdx []int
+	for i, r := range batchResult.Results {
+		if r.Error != "" {
+			failedIdx = append(failedIdx, i)
+		}
+	}
+
+	success := len(failedIdx) == 0
+	resp := BatchAPIResponse{
+		Success:   success,
+		Data:      &batchResult,
+		FailedIdx: failedIdx,
+	}
+	if !success {
+		resp.Error = fmt.Sprintf("%d of %d images had detection errors", len(failedIdx), batchResult.Total)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) HandlePoolStats(w http.ResponseWriter, r *http.Request) {

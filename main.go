@@ -33,6 +33,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/detect", h.HandleDetect)
 	mux.HandleFunc("POST /api/detect/form", h.HandleDetectForm)
+	mux.HandleFunc("POST /api/detect/batch", h.HandleBatchDetect)
 	mux.HandleFunc("GET /api/health", h.HandleHealth)
 	mux.HandleFunc("GET /api/pool/stats", h.HandlePoolStats)
 
@@ -50,6 +51,7 @@ func main() {
 	log.Printf("endpoints:")
 	log.Printf("  POST /api/detect        - JSON body: {\"image_path\": \"<local_path>\"}")
 	log.Printf("  POST /api/detect/form   - Form body: image_path=<local_path>")
+	log.Printf("  POST /api/detect/batch  - JSON body: {\"image_paths\": [\"<path1>\", \"<path2>\", ...]}")
 	log.Printf("  GET  /api/health        - health check with pool info")
 	log.Printf("  GET  /api/pool/stats    - detector pool statistics")
 
